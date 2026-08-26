@@ -1,6 +1,6 @@
 # GitHub API App
 
-A read-only Rust CLI client for `github-api`.
+A native read-only Rust GUI client for `github-api`.
 
 ## Configure
 
@@ -13,16 +13,20 @@ $env:API_KEY = "your-api-key"
 
 The API server must already be running, and the GitHub username must have connected through OAuth with private repository permission.
 
-## Run
+## Run the GUI
 
-List every accessible repository name and link:
+Start the desktop app:
 
 ```powershell
-cargo run -- MICKYcyber
+cargo run
 ```
 
-List every repository plus all file/folder names and links for one repository:
+Enter the API URL, API key, GitHub username, and repository name in the window. Use **Load repositories** to display every accessible repository name and link, or **Load contents** to display every file/folder name and link for the selected repository.
+
+The app also reads initial values from these environment variables:
 
 ```powershell
-cargo run -- MICKYcyber your-repository
+$env:API_BASE_URL = "http://127.0.0.1:3000"
+$env:API_KEY = "your-api-key"
+$env:GITHUB_USERNAME = "MICKYcyber"
 ```
