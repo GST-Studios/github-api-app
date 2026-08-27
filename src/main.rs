@@ -106,7 +106,7 @@ impl eframe::App for GithubApiApp {
                 .show_inside(interface, |panel| {
                     panel.heading("Repositories");
                     egui::ScrollArea::vertical().show(panel, |list| {
-                        for repository in &self.repositories {
+                        for repository in self.repositories.clone() {
                             let selected = self.repository == repository.name
                                 || self.repository
                                     == repository.name.rsplit('/').next().unwrap_or("");
@@ -119,6 +119,7 @@ impl eframe::App for GithubApiApp {
                                     .to_owned();
                                 self.contents.clear();
                                 self.status = format!("Selected {}.", self.repository);
+                                self.load_contents();
                             }
                         }
                     });
