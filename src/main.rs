@@ -5,26 +5,15 @@ use serde::Deserialize;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    sync::Arc,
-    thread,
 };
 use syntect::{
-    easy::HighlightLines,
-    highlighting::{Theme, ThemeSet},
-    parsing::SyntaxSet,
-    util::LinesWithEndings,
+    easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
 
 #[derive(Debug, Deserialize, Clone)]
 struct LinkItem {
     name: String,
     link: String,
-}
-
-enum LoadResult {
-    Repositories(Result<Vec<LinkItem>, String>),
-    Contents(Result<Vec<LinkItem>, String>),
 }
 
 struct GithubApiApp {
@@ -38,13 +27,9 @@ struct GithubApiApp {
     status: String,
     download_dir: PathBuf,
     ide_open: bool,
-    session_downloads: Vec<PathBuf>,
+    ide_files: Vec<PathBuf>,
     open_file: Option<PathBuf>,
     editor_text: String,
-    syntax_set: Arc<SyntaxSet>,
-    theme: Arc<Theme>,
-    request_receiver: Option<Receiver<LoadResult>>,
-    loading: bool,
     client: Client,
 }
 
@@ -64,13 +49,9 @@ impl Default for GithubApiApp {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("downloads")),
             ide_open: false,
-            session_downloads: Vec::new(),
+            ide_files: Vec::new(),
             open_file: None,
             editor_text: String::new(),
-            syntax_set: Arc::new(SyntaxSet::load_defaults_newlines()),
-            theme: Arc::new(default_theme()),
-            request_receiver: None,
-            loading: false,
             client: Client::new(),
         }
     }
@@ -78,7 +59,6 @@ impl Default for GithubApiApp {
 
 impl eframe::App for GithubApiApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_request();
         egui::CentralPanel::default().show(context, |interface| {
             interface.heading("GitHub API App");
             interface.label("Read-only repository browser");
@@ -111,16 +91,10 @@ impl eframe::App for GithubApiApp {
 
             interface.add_space(12.0);
             interface.horizontal(|actions| {
-                if actions
-                    .add_enabled(!self.loading, egui::Button::new("Load repositories"))
-                    .clicked()
-                {
+                if actions.button("Load repositories").clicked() {
                     self.load_repositories();
                 }
-                if actions
-                    .add_enabled(!self.loading, egui::Button::new("Load contents"))
-                    .clicked()
-                {
+                if actions.button("Load contents").clicked() {
                     self.load_contents();
                 }
                 if actions.button("Clear").clicked() {
@@ -182,22 +156,13 @@ impl GithubApiApp {
 
         let username = self.username.clone();
         let owner_kind = if self.organization { "orgs" } else { "users" };
-        let base_url = self.api_base_url.clone();
-        let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.request_receiver = Some(receiver);
-        self.loading = true;
-        self.status = "Loading repositories...".to_owned();
-        thread::spawn(move || {
-            let result = request_links(
-                &client,
-                &api_key,
-                &base_url,
-                &["v1", owner_kind, &username, "repositories"],
-            );
-            let _ = sender.send(LoadResult::Repositories(result));
-        });
+        match self.get_links(&["v1", owner_kind, &username, "repositories"]) {
+            Ok(repositories) => {
+                self.repositories = repositories;
+                self.status = format!("Loaded {} repositories.", self.repositories.len());
+            }
+            Err(error) => self.status = format!("Repository request failed: {error}"),
+        }
     }
 
     fn load_contents(&mut self) {
@@ -212,50 +177,12 @@ impl GithubApiApp {
         let username = self.username.clone();
         let repository = self.repository.clone();
         let owner_kind = if self.organization { "orgs" } else { "users" };
-        let base_url = self.api_base_url.clone();
-        let api_key = self.api_key.clone();
-        let client = self.client.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.request_receiver = Some(receiver);
-        self.loading = true;
-        self.status = "Loading repository contents...".to_owned();
-        thread::spawn(move || {
-            let result = request_links(
-                &client,
-                &api_key,
-                &base_url,
-                &["v1", owner_kind, &username, "repos", &repository, "tree"],
-            );
-            let _ = sender.send(LoadResult::Contents(result));
-        });
-    }
-
-    fn poll_request(&mut self) {
-        let result = self
-            .request_receiver
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok());
-        let Some(result) = result else {
-            return;
-        };
-
-        self.request_receiver = None;
-        self.loading = false;
-        match result {
-            LoadResult::Repositories(Ok(repositories)) => {
-                self.repositories = repositories;
-                self.status = format!("Loaded {} repositories.", self.repositories.len());
-            }
-            LoadResult::Repositories(Err(error)) => {
-                self.status = format!("Repository request failed: {error}");
-            }
-            LoadResult::Contents(Ok(contents)) => {
+        match self.get_links(&["v1", owner_kind, &username, "repos", &repository, "tree"]) {
+            Ok(contents) => {
                 self.contents = contents;
                 self.status = format!("Loaded {} repository items.", self.contents.len());
             }
-            LoadResult::Contents(Err(error)) => {
-                self.status = format!("Contents request failed: {error}");
-            }
+            Err(error) => self.status = format!("Contents request failed: {error}"),
         }
     }
 
@@ -289,9 +216,6 @@ impl GithubApiApp {
                     .and_then(|_| fs::write(&local_path, bytes).map_err(|error| error.to_string()))
                 {
                     Ok(()) => {
-                        if !self.session_downloads.contains(&local_path) {
-                            self.session_downloads.push(local_path.clone());
-                        }
                         self.open_local_file(local_path);
                         self.status = format!("Saved {} locally.", path);
                     }
@@ -306,13 +230,18 @@ impl GithubApiApp {
         self.editor_text = fs::read_to_string(&path)
             .unwrap_or_else(|_| "Binary or non-text file. It was saved locally.".to_owned());
         self.open_file = Some(path);
+        self.refresh_ide_files();
         self.ide_open = true;
     }
 
-    fn cleanup_session_downloads(&mut self) {
-        for path in self.session_downloads.drain(..) {
-            let _ = fs::remove_file(path);
-        }
+    fn refresh_ide_files(&mut self) {
+        self.ide_files.clear();
+        let root = self
+            .download_dir
+            .join(self.username.trim())
+            .join(self.repository.trim());
+        collect_files(&root, &mut self.ide_files);
+        self.ide_files.sort();
     }
 
     fn show_ide(&mut self, context: &egui::Context) {
@@ -327,11 +256,6 @@ impl GithubApiApp {
                 .with_title("GitHub API IDE")
                 .with_inner_size([1000.0, 700.0]),
             |context, _class| {
-                if context.input(|input| input.viewport().close_requested()) {
-                    self.ide_open = false;
-                    self.cleanup_session_downloads();
-                    return;
-                }
                 egui::TopBottomPanel::top("ide_toolbar").show(context, |toolbar| {
                     toolbar.horizontal(|actions| {
                         actions.heading("Local IDE");
@@ -345,30 +269,45 @@ impl GithubApiApp {
                         }
                         if actions.button("Close window").clicked() {
                             self.ide_open = false;
-                            self.cleanup_session_downloads();
                             context.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
                 });
+
+                egui::SidePanel::left("ide_files")
+                    .resizable(true)
+                    .default_width(280.0)
+                    .show(context, |panel| {
+                        panel.heading("Downloaded files");
+                        egui::ScrollArea::vertical().show(panel, |list| {
+                            for path in self.ide_files.clone() {
+                                let selected = self.open_file.as_ref() == Some(&path);
+                                let label = path
+                                    .strip_prefix(&self.download_dir)
+                                    .unwrap_or(&path)
+                                    .display()
+                                    .to_string();
+                                if list.selectable_label(selected, label).clicked() {
+                                    self.open_local_file(path.clone());
+                                }
+                            }
+                        });
+                    });
 
                 egui::CentralPanel::default().show(context, |editor| {
                     if let Some(path) = &self.open_file {
                         editor.label(path.display().to_string());
                     }
                     let file_path = self.open_file.clone();
-                    let syntax_set = self.syntax_set.clone();
-                    let theme = self.theme.clone();
                     let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
-                        let job = highlight_code(text, file_path.as_deref(), &syntax_set, &theme);
+                        let job = highlight_code(text, file_path.as_deref());
                         ui.fonts(|fonts| fonts.layout_job(job))
                     };
-                    let editor_size = editor.available_size();
-                    editor.add_sized(
-                        editor_size,
+                    editor.add(
                         egui::TextEdit::multiline(&mut self.editor_text)
                             .code_editor()
-                            .desired_width(editor_size.x)
-                            .desired_rows(1)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(30)
                             .layouter(&mut layouter),
                     );
                 });
@@ -386,6 +325,27 @@ impl GithubApiApp {
             return Err(());
         }
         Ok(())
+    }
+
+    fn get_links(&self, path_segments: &[&str]) -> Result<Vec<LinkItem>, String> {
+        let mut url = Url::parse(self.api_base_url.trim_end_matches('/'))
+            .map_err(|error| format!("invalid API URL: {error}"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| "API URL cannot be a base URL".to_owned())?;
+            segments.extend(path_segments.iter().copied());
+        }
+
+        self.client
+            .get(url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json::<Vec<LinkItem>>()
+            .map_err(|error| error.to_string())
     }
 
     fn get_file(&self, path_segments: &[&str], path: &str) -> Result<Vec<u8>, String> {
@@ -412,32 +372,6 @@ impl GithubApiApp {
     }
 }
 
-fn request_links(
-    client: &Client,
-    api_key: &str,
-    base_url: &str,
-    path_segments: &[&str],
-) -> Result<Vec<LinkItem>, String> {
-    let mut url = Url::parse(base_url.trim_end_matches('/'))
-        .map_err(|error| format!("invalid API URL: {error}"))?;
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| "API URL cannot be a base URL".to_owned())?;
-        segments.extend(path_segments.iter().copied());
-    }
-
-    client
-        .get(url)
-        .header("X-API-Key", api_key)
-        .send()
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<Vec<LinkItem>>()
-        .map_err(|error| error.to_string())
-}
-
 fn safe_relative_path(path: &str) -> PathBuf {
     path.split('/')
         .filter(|component| !component.is_empty() && *component != "." && *component != "..")
@@ -447,29 +381,17 @@ fn safe_relative_path(path: &str) -> PathBuf {
         })
 }
 
-fn default_theme() -> Theme {
-    let mut theme_set = ThemeSet::load_defaults();
-    theme_set
-        .themes
-        .remove("base16-ocean.dark")
-        .or_else(|| theme_set.themes.into_values().next())
-        .expect("syntect includes a default theme")
-}
-
-fn highlight_code(
-    text: &str,
-    path: Option<&Path>,
-    syntax_set: &SyntaxSet,
-    theme: &Theme,
-) -> LayoutJob {
+fn highlight_code(text: &str, path: Option<&Path>) -> LayoutJob {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let theme_set = ThemeSet::load_defaults();
     let syntax = path
         .and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
-        .or_else(|| {
-            text.lines()
-                .next()
-                .and_then(|line| syntax_set.find_syntax_by_first_line(line))
-        })
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let theme = theme_set
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| theme_set.themes.values().next())
+        .expect("syntect includes a default theme");
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut job = LayoutJob::default();
 
@@ -494,6 +416,20 @@ fn highlight_code(
         }
     }
     job
+}
+
+fn collect_files(root: &PathBuf, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
