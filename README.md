@@ -21,7 +21,7 @@ Start the desktop app:
 cargo run
 ```
 
-Enter the API URL, API key, GitHub username, and repository name in the window. Use **Load repositories** to display every accessible repository name and link, or **Load contents** to display every file/folder name and link for the selected repository.
+Enter the API URL, API key, GitHub username or organization name, and repository name in the window. Enable **Owner is organization** for `GST-Studios`. Use **Load repositories** to display every accessible repository name and link, or **Load contents** to display every file/folder name and link for the selected repository.
 
 The app also reads initial values from these environment variables:
 

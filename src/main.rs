@@ -13,6 +13,7 @@ struct GithubApiApp {
     api_base_url: String,
     api_key: String,
     username: String,
+    organization: bool,
     repository: String,
     repositories: Vec<LinkItem>,
     contents: Vec<LinkItem>,
@@ -27,6 +28,7 @@ impl Default for GithubApiApp {
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
             api_key: env::var("API_KEY").unwrap_or_default(),
             username: env::var("GITHUB_USERNAME").unwrap_or_default(),
+            organization: false,
             repository: String::new(),
             repositories: Vec::new(),
             contents: Vec::new(),
@@ -57,6 +59,10 @@ impl eframe::App for GithubApiApp {
 
                     fields.label("GitHub username");
                     fields.text_edit_singleline(&mut self.username);
+                    fields.end_row();
+
+                    fields.label("Owner is organization");
+                    fields.checkbox(&mut self.organization, "Use /orgs endpoints");
                     fields.end_row();
 
                     fields.label("Repository");
@@ -113,7 +119,8 @@ impl GithubApiApp {
         }
 
         let username = self.username.clone();
-        match self.get_links(&["v1", "users", &username, "repositories"]) {
+        let owner_kind = if self.organization { "orgs" } else { "users" };
+        match self.get_links(&["v1", owner_kind, &username, "repositories"]) {
             Ok(repositories) => {
                 self.repositories = repositories;
                 self.status = format!("Loaded {} repositories.", self.repositories.len());
@@ -133,7 +140,8 @@ impl GithubApiApp {
 
         let username = self.username.clone();
         let repository = self.repository.clone();
-        match self.get_links(&["v1", "users", &username, "repos", &repository, "tree"]) {
+        let owner_kind = if self.organization { "orgs" } else { "users" };
+        match self.get_links(&["v1", owner_kind, &username, "repos", &repository, "tree"]) {
             Ok(contents) => {
                 self.contents = contents;
                 self.status = format!("Loaded {} repository items.", self.contents.len());
