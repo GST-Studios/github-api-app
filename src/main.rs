@@ -362,11 +362,13 @@ impl GithubApiApp {
                         let job = highlight_code(text, file_path.as_deref(), &syntax_set, &theme);
                         ui.fonts(|fonts| fonts.layout_job(job))
                     };
-                    editor.add(
+                    let editor_size = editor.available_size();
+                    editor.add_sized(
+                        editor_size,
                         egui::TextEdit::multiline(&mut self.editor_text)
                             .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(30)
+                            .desired_width(editor_size.x)
+                            .desired_rows(1)
                             .layouter(&mut layouter),
                     );
                 });
