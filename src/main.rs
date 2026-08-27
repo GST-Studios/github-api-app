@@ -6,10 +6,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
+    sync::Arc,
     thread,
 };
 use syntect::{
-    easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
+    easy::HighlightLines,
+    highlighting::{Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -34,9 +38,11 @@ struct GithubApiApp {
     status: String,
     download_dir: PathBuf,
     ide_open: bool,
-    ide_files: Vec<PathBuf>,
+    session_downloads: Vec<PathBuf>,
     open_file: Option<PathBuf>,
     editor_text: String,
+    syntax_set: Arc<SyntaxSet>,
+    theme: Arc<Theme>,
     request_receiver: Option<Receiver<LoadResult>>,
     loading: bool,
     client: Client,
@@ -58,9 +64,11 @@ impl Default for GithubApiApp {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("downloads")),
             ide_open: false,
-            ide_files: Vec::new(),
+            session_downloads: Vec::new(),
             open_file: None,
             editor_text: String::new(),
+            syntax_set: Arc::new(SyntaxSet::load_defaults_newlines()),
+            theme: Arc::new(default_theme()),
             request_receiver: None,
             loading: false,
             client: Client::new(),
@@ -281,6 +289,9 @@ impl GithubApiApp {
                     .and_then(|_| fs::write(&local_path, bytes).map_err(|error| error.to_string()))
                 {
                     Ok(()) => {
+                        if !self.session_downloads.contains(&local_path) {
+                            self.session_downloads.push(local_path.clone());
+                        }
                         self.open_local_file(local_path);
                         self.status = format!("Saved {} locally.", path);
                     }
@@ -295,18 +306,13 @@ impl GithubApiApp {
         self.editor_text = fs::read_to_string(&path)
             .unwrap_or_else(|_| "Binary or non-text file. It was saved locally.".to_owned());
         self.open_file = Some(path);
-        self.refresh_ide_files();
         self.ide_open = true;
     }
 
-    fn refresh_ide_files(&mut self) {
-        self.ide_files.clear();
-        let root = self
-            .download_dir
-            .join(self.username.trim())
-            .join(self.repository.trim());
-        collect_files(&root, &mut self.ide_files);
-        self.ide_files.sort();
+    fn cleanup_session_downloads(&mut self) {
+        for path in self.session_downloads.drain(..) {
+            let _ = fs::remove_file(path);
+        }
     }
 
     fn show_ide(&mut self, context: &egui::Context) {
@@ -323,6 +329,7 @@ impl GithubApiApp {
             |context, _class| {
                 if context.input(|input| input.viewport().close_requested()) {
                     self.ide_open = false;
+                    self.cleanup_session_downloads();
                     return;
                 }
                 egui::TopBottomPanel::top("ide_toolbar").show(context, |toolbar| {
@@ -338,38 +345,21 @@ impl GithubApiApp {
                         }
                         if actions.button("Close window").clicked() {
                             self.ide_open = false;
+                            self.cleanup_session_downloads();
                             context.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
                 });
-
-                egui::SidePanel::left("ide_files")
-                    .resizable(true)
-                    .default_width(280.0)
-                    .show(context, |panel| {
-                        panel.heading("Downloaded files");
-                        egui::ScrollArea::vertical().show(panel, |list| {
-                            for path in self.ide_files.clone() {
-                                let selected = self.open_file.as_ref() == Some(&path);
-                                let label = path
-                                    .strip_prefix(&self.download_dir)
-                                    .unwrap_or(&path)
-                                    .display()
-                                    .to_string();
-                                if list.selectable_label(selected, label).clicked() {
-                                    self.open_local_file(path.clone());
-                                }
-                            }
-                        });
-                    });
 
                 egui::CentralPanel::default().show(context, |editor| {
                     if let Some(path) = &self.open_file {
                         editor.label(path.display().to_string());
                     }
                     let file_path = self.open_file.clone();
+                    let syntax_set = self.syntax_set.clone();
+                    let theme = self.theme.clone();
                     let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
-                        let job = highlight_code(text, file_path.as_deref());
+                        let job = highlight_code(text, file_path.as_deref(), &syntax_set, &theme);
                         ui.fonts(|fonts| fonts.layout_job(job))
                     };
                     editor.add(
@@ -455,17 +445,29 @@ fn safe_relative_path(path: &str) -> PathBuf {
         })
 }
 
-fn highlight_code(text: &str, path: Option<&Path>) -> LayoutJob {
-    let syntax_set = SyntaxSet::load_defaults_newlines();
-    let theme_set = ThemeSet::load_defaults();
+fn default_theme() -> Theme {
+    let mut theme_set = ThemeSet::load_defaults();
+    theme_set
+        .themes
+        .remove("base16-ocean.dark")
+        .or_else(|| theme_set.themes.into_values().next())
+        .expect("syntect includes a default theme")
+}
+
+fn highlight_code(
+    text: &str,
+    path: Option<&Path>,
+    syntax_set: &SyntaxSet,
+    theme: &Theme,
+) -> LayoutJob {
     let syntax = path
         .and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
+        .or_else(|| {
+            text.lines()
+                .next()
+                .and_then(|line| syntax_set.find_syntax_by_first_line(line))
+        })
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let theme = theme_set
-        .themes
-        .get("base16-ocean.dark")
-        .or_else(|| theme_set.themes.values().next())
-        .expect("syntect includes a default theme");
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut job = LayoutJob::default();
 
@@ -490,20 +492,6 @@ fn highlight_code(text: &str, path: Option<&Path>) -> LayoutJob {
         }
     }
     job
-}
-
-fn collect_files(root: &PathBuf, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, files);
-        } else {
-            files.push(path);
-        }
-    }
 }
 
 fn main() -> eframe::Result<()> {

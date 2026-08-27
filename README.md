@@ -23,7 +23,9 @@ cargo run
 
 Enter the API URL, API key, GitHub username or organization name, and repository name in the window. Enable **Owner is organization** for `GST-Studios`. Use **Load repositories** to display every accessible repository name and link, or **Load contents** to display every file/folder name and link for the selected repository.
 
-Click a file under **Repository contents** to download it into `downloads/<owner>/<repository>/`. The file opens in a separate local IDE window with a downloaded-file tree and editor. Changes made there are saved locally only; this app never writes to GitHub.
+Click a file under **Repository contents** to download it into `downloads/<owner>/<repository>/`. The file opens in a separate local IDE window with a syntax-highlighted editor. Changes made there are saved locally only; this app never writes to GitHub.
+
+Temporary downloaded files are deleted automatically when the IDE window closes.
 
 Repository and contents requests run in the background, so the main window stays responsive while GitHub responds. The IDE window can be closed with its normal Windows close button.
 
