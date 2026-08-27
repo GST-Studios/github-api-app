@@ -1,7 +1,14 @@
 use eframe::egui;
+use egui::text::{LayoutJob, TextFormat};
 use reqwest::{blocking::Client, Url};
 use serde::Deserialize;
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+use syntect::{
+    easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
+};
 
 #[derive(Debug, Deserialize, Clone)]
 struct LinkItem {
@@ -288,11 +295,17 @@ impl GithubApiApp {
                     if let Some(path) = &self.open_file {
                         editor.label(path.display().to_string());
                     }
+                    let file_path = self.open_file.clone();
+                    let mut layouter = move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                        let job = highlight_code(text, file_path.as_deref());
+                        ui.fonts(|fonts| fonts.layout_job(job))
+                    };
                     editor.add(
                         egui::TextEdit::multiline(&mut self.editor_text)
                             .code_editor()
                             .desired_width(f32::INFINITY)
-                            .desired_rows(30),
+                            .desired_rows(30)
+                            .layouter(&mut layouter),
                     );
                 });
             },
@@ -363,6 +376,43 @@ fn safe_relative_path(path: &str) -> PathBuf {
             output.push(component);
             output
         })
+}
+
+fn highlight_code(text: &str, path: Option<&Path>) -> LayoutJob {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let theme_set = ThemeSet::load_defaults();
+    let syntax = path
+        .and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let theme = theme_set
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| theme_set.themes.values().next())
+        .expect("syntect includes a default theme");
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut job = LayoutJob::default();
+
+    for line in LinesWithEndings::from(text) {
+        let ranges = highlighter
+            .highlight_line(line, &syntax_set)
+            .unwrap_or_default();
+        for (style, highlighted) in ranges {
+            job.append(
+                highlighted,
+                0.0,
+                TextFormat {
+                    color: egui::Color32::from_rgb(
+                        style.foreground.r,
+                        style.foreground.g,
+                        style.foreground.b,
+                    ),
+                    font_id: egui::FontId::monospace(14.0),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    job
 }
 
 fn collect_files(root: &PathBuf, files: &mut Vec<PathBuf>) {
