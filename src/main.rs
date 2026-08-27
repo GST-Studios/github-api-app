@@ -5,6 +5,8 @@ use serde::Deserialize;
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
 };
 use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
@@ -14,6 +16,11 @@ use syntect::{
 struct LinkItem {
     name: String,
     link: String,
+}
+
+enum LoadResult {
+    Repositories(Result<Vec<LinkItem>, String>),
+    Contents(Result<Vec<LinkItem>, String>),
 }
 
 struct GithubApiApp {
@@ -30,6 +37,8 @@ struct GithubApiApp {
     ide_files: Vec<PathBuf>,
     open_file: Option<PathBuf>,
     editor_text: String,
+    request_receiver: Option<Receiver<LoadResult>>,
+    loading: bool,
     client: Client,
 }
 
@@ -52,6 +61,8 @@ impl Default for GithubApiApp {
             ide_files: Vec::new(),
             open_file: None,
             editor_text: String::new(),
+            request_receiver: None,
+            loading: false,
             client: Client::new(),
         }
     }
@@ -59,6 +70,7 @@ impl Default for GithubApiApp {
 
 impl eframe::App for GithubApiApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_request();
         egui::CentralPanel::default().show(context, |interface| {
             interface.heading("GitHub API App");
             interface.label("Read-only repository browser");
@@ -91,10 +103,16 @@ impl eframe::App for GithubApiApp {
 
             interface.add_space(12.0);
             interface.horizontal(|actions| {
-                if actions.button("Load repositories").clicked() {
+                if actions
+                    .add_enabled(!self.loading, egui::Button::new("Load repositories"))
+                    .clicked()
+                {
                     self.load_repositories();
                 }
-                if actions.button("Load contents").clicked() {
+                if actions
+                    .add_enabled(!self.loading, egui::Button::new("Load contents"))
+                    .clicked()
+                {
                     self.load_contents();
                 }
                 if actions.button("Clear").clicked() {
@@ -156,13 +174,22 @@ impl GithubApiApp {
 
         let username = self.username.clone();
         let owner_kind = if self.organization { "orgs" } else { "users" };
-        match self.get_links(&["v1", owner_kind, &username, "repositories"]) {
-            Ok(repositories) => {
-                self.repositories = repositories;
-                self.status = format!("Loaded {} repositories.", self.repositories.len());
-            }
-            Err(error) => self.status = format!("Repository request failed: {error}"),
-        }
+        let base_url = self.api_base_url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.request_receiver = Some(receiver);
+        self.loading = true;
+        self.status = "Loading repositories...".to_owned();
+        thread::spawn(move || {
+            let result = request_links(
+                &client,
+                &api_key,
+                &base_url,
+                &["v1", owner_kind, &username, "repositories"],
+            );
+            let _ = sender.send(LoadResult::Repositories(result));
+        });
     }
 
     fn load_contents(&mut self) {
@@ -177,12 +204,50 @@ impl GithubApiApp {
         let username = self.username.clone();
         let repository = self.repository.clone();
         let owner_kind = if self.organization { "orgs" } else { "users" };
-        match self.get_links(&["v1", owner_kind, &username, "repos", &repository, "tree"]) {
-            Ok(contents) => {
+        let base_url = self.api_base_url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.request_receiver = Some(receiver);
+        self.loading = true;
+        self.status = "Loading repository contents...".to_owned();
+        thread::spawn(move || {
+            let result = request_links(
+                &client,
+                &api_key,
+                &base_url,
+                &["v1", owner_kind, &username, "repos", &repository, "tree"],
+            );
+            let _ = sender.send(LoadResult::Contents(result));
+        });
+    }
+
+    fn poll_request(&mut self) {
+        let result = self
+            .request_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(result) = result else {
+            return;
+        };
+
+        self.request_receiver = None;
+        self.loading = false;
+        match result {
+            LoadResult::Repositories(Ok(repositories)) => {
+                self.repositories = repositories;
+                self.status = format!("Loaded {} repositories.", self.repositories.len());
+            }
+            LoadResult::Repositories(Err(error)) => {
+                self.status = format!("Repository request failed: {error}");
+            }
+            LoadResult::Contents(Ok(contents)) => {
                 self.contents = contents;
                 self.status = format!("Loaded {} repository items.", self.contents.len());
             }
-            Err(error) => self.status = format!("Contents request failed: {error}"),
+            LoadResult::Contents(Err(error)) => {
+                self.status = format!("Contents request failed: {error}");
+            }
         }
     }
 
@@ -253,6 +318,10 @@ impl GithubApiApp {
                 .with_title("GitHub API IDE")
                 .with_inner_size([1000.0, 700.0]),
             |context, _class| {
+                if context.input(|input| input.viewport().close_requested()) {
+                    self.ide_open = false;
+                    return;
+                }
                 egui::TopBottomPanel::top("ide_toolbar").show(context, |toolbar| {
                     toolbar.horizontal(|actions| {
                         actions.heading("Local IDE");
@@ -324,27 +393,6 @@ impl GithubApiApp {
         Ok(())
     }
 
-    fn get_links(&self, path_segments: &[&str]) -> Result<Vec<LinkItem>, String> {
-        let mut url = Url::parse(self.api_base_url.trim_end_matches('/'))
-            .map_err(|error| format!("invalid API URL: {error}"))?;
-        {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| "API URL cannot be a base URL".to_owned())?;
-            segments.extend(path_segments.iter().copied());
-        }
-
-        self.client
-            .get(url)
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json::<Vec<LinkItem>>()
-            .map_err(|error| error.to_string())
-    }
-
     fn get_file(&self, path_segments: &[&str], path: &str) -> Result<Vec<u8>, String> {
         let mut url = Url::parse(self.api_base_url.trim_end_matches('/'))
             .map_err(|error| format!("invalid API URL: {error}"))?;
@@ -367,6 +415,32 @@ impl GithubApiApp {
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string())
     }
+}
+
+fn request_links(
+    client: &Client,
+    api_key: &str,
+    base_url: &str,
+    path_segments: &[&str],
+) -> Result<Vec<LinkItem>, String> {
+    let mut url = Url::parse(base_url.trim_end_matches('/'))
+        .map_err(|error| format!("invalid API URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "API URL cannot be a base URL".to_owned())?;
+        segments.extend(path_segments.iter().copied());
+    }
+
+    client
+        .get(url)
+        .header("X-API-Key", api_key)
+        .send()
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json::<Vec<LinkItem>>()
+        .map_err(|error| error.to_string())
 }
 
 fn safe_relative_path(path: &str) -> PathBuf {
