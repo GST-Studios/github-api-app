@@ -23,6 +23,8 @@ cargo run
 
 Enter the API URL, API key, GitHub username or organization name, and repository name in the window. Enable **Owner is organization** for `GST-Studios`. Use **Load repositories** to display every accessible repository name and link, or **Load contents** to display every file/folder name and link for the selected repository.
 
+Click a file under **Repository contents** to download it into `downloads/<owner>/<repository>/`. The file opens in a separate local IDE window with a downloaded-file tree and editor. Changes made there are saved locally only; this app never writes to GitHub.
+
 The app also reads initial values from these environment variables:
 
 ```powershell
