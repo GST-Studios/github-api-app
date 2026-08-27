@@ -1,7 +1,7 @@
 use eframe::egui;
 use reqwest::{blocking::Client, Url};
 use serde::Deserialize;
-use std::env;
+use std::{env, fs, path::PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
 struct LinkItem {
@@ -18,6 +18,11 @@ struct GithubApiApp {
     repositories: Vec<LinkItem>,
     contents: Vec<LinkItem>,
     status: String,
+    download_dir: PathBuf,
+    ide_open: bool,
+    ide_files: Vec<PathBuf>,
+    open_file: Option<PathBuf>,
+    editor_text: String,
     client: Client,
 }
 
@@ -33,6 +38,13 @@ impl Default for GithubApiApp {
             repositories: Vec::new(),
             contents: Vec::new(),
             status: "Enter your API key and GitHub username to begin.".to_owned(),
+            download_dir: env::var("DOWNLOAD_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("downloads")),
+            ide_open: false,
+            ide_files: Vec::new(),
+            open_file: None,
+            editor_text: String::new(),
             client: Client::new(),
         }
     }
@@ -95,7 +107,19 @@ impl eframe::App for GithubApiApp {
                     panel.heading("Repositories");
                     egui::ScrollArea::vertical().show(panel, |list| {
                         for repository in &self.repositories {
-                            list.hyperlink_to(&repository.name, &repository.link);
+                            let selected = self.repository == repository.name
+                                || self.repository
+                                    == repository.name.rsplit('/').next().unwrap_or("");
+                            if list.selectable_label(selected, &repository.name).clicked() {
+                                self.repository = repository
+                                    .name
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&repository.name)
+                                    .to_owned();
+                                self.contents.clear();
+                                self.status = format!("Selected {}.", self.repository);
+                            }
                         }
                     });
                 });
@@ -103,12 +127,16 @@ impl eframe::App for GithubApiApp {
             egui::CentralPanel::default().show_inside(interface, |panel| {
                 panel.heading("Repository contents");
                 egui::ScrollArea::vertical().show(panel, |list| {
-                    for item in &self.contents {
-                        list.hyperlink_to(&item.name, &item.link);
+                    for item in self.contents.clone() {
+                        if list.button(format!("Download {}", item.name)).clicked() {
+                            self.download_item(&item);
+                        }
                     }
                 });
             });
         });
+
+        self.show_ide(context);
     }
 }
 
@@ -150,6 +178,126 @@ impl GithubApiApp {
         }
     }
 
+    fn download_item(&mut self, item: &LinkItem) {
+        if !item.link.contains("/blob/") {
+            self.status = format!("{} is a folder; download a file inside it.", item.name);
+            return;
+        }
+
+        let owner_kind = if self.organization { "orgs" } else { "users" };
+        let owner = self.username.clone();
+        let repository = self.repository.clone();
+        let path = item.name.clone();
+        match self.get_file(
+            &["v1", owner_kind, &owner, "repos", &repository, "file"],
+            &path,
+        ) {
+            Ok(bytes) => {
+                let relative_path = safe_relative_path(&path);
+                let local_path = self
+                    .download_dir
+                    .join(&owner)
+                    .join(&repository)
+                    .join(relative_path);
+                match local_path
+                    .parent()
+                    .ok_or_else(|| "invalid local file path".to_owned())
+                    .and_then(|parent| {
+                        fs::create_dir_all(parent).map_err(|error| error.to_string())
+                    })
+                    .and_then(|_| fs::write(&local_path, bytes).map_err(|error| error.to_string()))
+                {
+                    Ok(()) => {
+                        self.open_local_file(local_path);
+                        self.status = format!("Saved {} locally.", path);
+                    }
+                    Err(error) => self.status = format!("Could not save file: {error}"),
+                }
+            }
+            Err(error) => self.status = format!("Download failed: {error}"),
+        }
+    }
+
+    fn open_local_file(&mut self, path: PathBuf) {
+        self.editor_text = fs::read_to_string(&path)
+            .unwrap_or_else(|_| "Binary or non-text file. It was saved locally.".to_owned());
+        self.open_file = Some(path);
+        self.refresh_ide_files();
+        self.ide_open = true;
+    }
+
+    fn refresh_ide_files(&mut self) {
+        self.ide_files.clear();
+        let root = self.download_dir.clone();
+        collect_files(&root, &mut self.ide_files);
+        self.ide_files.sort();
+    }
+
+    fn show_ide(&mut self, context: &egui::Context) {
+        if !self.ide_open {
+            return;
+        }
+
+        let viewport = egui::ViewportId::from_hash_of("github-api-ide");
+        context.show_viewport_immediate(
+            viewport,
+            egui::ViewportBuilder::default()
+                .with_title("GitHub API IDE")
+                .with_inner_size([1000.0, 700.0]),
+            |context, _class| {
+                egui::TopBottomPanel::top("ide_toolbar").show(context, |toolbar| {
+                    toolbar.horizontal(|actions| {
+                        actions.heading("Local IDE");
+                        if actions.button("Save locally").clicked() {
+                            if let Some(path) = &self.open_file {
+                                match fs::write(path, &self.editor_text) {
+                                    Ok(()) => self.status = "Saved local changes.".to_owned(),
+                                    Err(error) => self.status = format!("Save failed: {error}"),
+                                }
+                            }
+                        }
+                        if actions.button("Close window").clicked() {
+                            self.ide_open = false;
+                            context.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+
+                egui::SidePanel::left("ide_files")
+                    .resizable(true)
+                    .default_width(280.0)
+                    .show(context, |panel| {
+                        panel.heading("Downloaded files");
+                        egui::ScrollArea::vertical().show(panel, |list| {
+                            for path in self.ide_files.clone() {
+                                let selected = self.open_file.as_ref() == Some(&path);
+                                let label = path
+                                    .strip_prefix(&self.download_dir)
+                                    .unwrap_or(&path)
+                                    .display()
+                                    .to_string();
+                                if list.selectable_label(selected, label).clicked() {
+                                    self.open_local_file(path.clone());
+                                }
+                            }
+                        });
+                    });
+
+                egui::CentralPanel::default().show(context, |editor| {
+                    if let Some(path) = &self.open_file {
+                        editor.label(path.display().to_string());
+                    }
+                    editor.add(
+                        egui::TextEdit::multiline(&mut self.editor_text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(30),
+                    );
+                });
+            },
+        );
+    }
+
     fn validate_inputs(&mut self) -> Result<(), ()> {
         if self.api_key.trim().is_empty() {
             self.status = "Enter an API key first.".to_owned();
@@ -181,6 +329,52 @@ impl GithubApiApp {
             .map_err(|error| error.to_string())?
             .json::<Vec<LinkItem>>()
             .map_err(|error| error.to_string())
+    }
+
+    fn get_file(&self, path_segments: &[&str], path: &str) -> Result<Vec<u8>, String> {
+        let mut url = Url::parse(self.api_base_url.trim_end_matches('/'))
+            .map_err(|error| format!("invalid API URL: {error}"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| "API URL cannot be a base URL".to_owned())?;
+            segments.extend(path_segments.iter().copied());
+        }
+        url.query_pairs_mut().append_pair("path", path);
+
+        self.client
+            .get(url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn safe_relative_path(path: &str) -> PathBuf {
+    path.split('/')
+        .filter(|component| !component.is_empty() && *component != "." && *component != "..")
+        .fold(PathBuf::new(), |mut output, component| {
+            output.push(component);
+            output
+        })
+}
+
+fn collect_files(root: &PathBuf, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, files);
+        } else {
+            files.push(path);
+        }
     }
 }
 
