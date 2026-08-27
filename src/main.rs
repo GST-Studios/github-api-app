@@ -301,7 +301,10 @@ impl GithubApiApp {
 
     fn refresh_ide_files(&mut self) {
         self.ide_files.clear();
-        let root = self.download_dir.clone();
+        let root = self
+            .download_dir
+            .join(self.username.trim())
+            .join(self.repository.trim());
         collect_files(&root, &mut self.ide_files);
         self.ide_files.sort();
     }
